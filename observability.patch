@@ -1,0 +1,442 @@
+diff --git a/internal/config/observability_test.go b/internal/config/observability_test.go
+new file mode 100644
+index 0000000..c32e026
+--- /dev/null
++++ b/internal/config/observability_test.go
+@@ -0,0 +1,26 @@
++package config
++
++import (
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func TestConfig_ObservabilityPaths(t *testing.T) {
++	for _, tc := range []struct {
++		yaml  string
++		paths []string
++	}{
++		{upstreamConfigHeader, nil},
++		{"upstream: {}\n" + upstreamConfigHeader, nil},
++		{"upstream:\n  observabilityPaths: [/metrics, /health]\n" + upstreamConfigHeader, []string{"/metrics", "/health"}},
++	} {
++		cfg, err := LoadConfigFromReader(strings.NewReader(tc.yaml))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !reflect.DeepEqual(cfg.Upstream.ObservabilityPaths, tc.paths) {
++			t.Fatalf("paths=%v expected=%v", cfg.Upstream.ObservabilityPaths, tc.paths)
++		}
++	}
++}
+diff --git a/internal/config/upstream.go b/internal/config/upstream.go
+index 8419e81..c20602e 100644
+--- a/internal/config/upstream.go
++++ b/internal/config/upstream.go
+@@ -22,6 +22,7 @@ func DefaultUpstreamIgnorePaths() []*regexp.Regexp {
+ 
+ // UpstreamConfig controls behaviour of the /upstream passthrough endpoint.
+ type UpstreamConfig struct {
++	ObservabilityPaths []string `yaml:"observabilityPaths"`
+ 	// IgnorePaths is a slice of compiled regular expressions. Any request to
+ 	// /upstream/<model>/<path> whose remaining path matches any of these
+ 	// expressions will be ignored and not trigger a swap. When the config
+@@ -32,7 +33,8 @@ type UpstreamConfig struct {
+ // rawUpstreamConfig is the intermediate form used to unmarshal the YAML into
+ // plain strings, which are then compiled into *regexp.Regexp.
+ type rawUpstreamConfig struct {
+-	IgnorePaths []string `yaml:"ignorePaths"`
++	ObservabilityPaths []string `yaml:"observabilityPaths"`
++	IgnorePaths        []string `yaml:"ignorePaths"`
+ }
+ 
+ // UnmarshalYAML compiles each ignorePaths entry into a *regexp.Regexp. If any
+@@ -51,5 +53,6 @@ func (u *UpstreamConfig) UnmarshalYAML(value *yaml.Node) error {
+ 		patterns = append(patterns, re)
+ 	}
+ 	u.IgnorePaths = patterns
++	u.ObservabilityPaths = raw.ObservabilityPaths
+ 	return nil
+ }
+diff --git a/internal/process/observability.go b/internal/process/observability.go
+new file mode 100644
+index 0000000..11bbb0f
+--- /dev/null
++++ b/internal/process/observability.go
+@@ -0,0 +1,19 @@
++package process
++
++import (
++	"fmt"
++	"net/http"
++)
++
++func (p *ProcessCommand) ServeReadyHTTP(w http.ResponseWriter, r *http.Request) {
++	p.serveReady(w, r, p.State())
++}
++
++func (p *ProcessCommand) serveReady(w http.ResponseWriter, r *http.Request, state ProcessState) {
++	fn := p.handler.Load()
++	if state != StateReady || fn == nil {
++		http.Error(w, fmt.Sprintf("llama-swap-error: [%s] process is not ready", p.id), http.StatusServiceUnavailable)
++		return
++	}
++	(*fn)(w, r)
++}
+diff --git a/internal/process/observability_test.go b/internal/process/observability_test.go
+new file mode 100644
+index 0000000..a45f82f
+--- /dev/null
++++ b/internal/process/observability_test.go
+@@ -0,0 +1,69 @@
++package process
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func TestProcessCommand_ReadyForwardingDoesNotRefreshLiveness(t *testing.T) {
++	p := &ProcessCommand{id: "observability"}
++	p.lastUse.Store(123)
++	p.inflight.Store(2)
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if p.lastUse.Load() != 123 || p.inflight.Load() != 2 {
++			t.Error("observation changed process liveness bookkeeping")
++		}
++		w.WriteHeader(http.StatusOK)
++	})
++	p.handler.Store(&handler)
++	for _, method := range []string{http.MethodGet, http.MethodHead} {
++		w := httptest.NewRecorder()
++		p.serveReady(w, httptest.NewRequest(method, "/metrics", nil), StateReady)
++		if w.Code != http.StatusOK {
++			t.Fatalf("status=%d", w.Code)
++		}
++		if p.lastUse.Load() != 123 || p.inflight.Load() != 2 {
++			t.Fatal("completed observation changed process liveness bookkeeping")
++		}
++	}
++	ordinary := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if p.inflight.Load() != 3 {
++			t.Error("ordinary request did not update inflight bookkeeping")
++		}
++		w.WriteHeader(http.StatusOK)
++	})
++	p.handler.Store(&ordinary)
++	p.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/props", nil))
++	if p.inflight.Load() != 2 || p.lastUse.Load() == 123 {
++		t.Fatal("ordinary request did not restore inflight and refresh lastUse")
++	}
++}
++
++func TestProcessCommand_ReadyForwardingRejectsUnready(t *testing.T) {
++	for _, state := range []ProcessState{StateStopped, StateStarting, StateStopping, StateShutdown} {
++		t.Run(string(state), func(t *testing.T) {
++			p := &ProcessCommand{id: "observability"}
++			p.lastUse.Store(123)
++			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("unready observation reached handler") })
++			p.handler.Store(&handler)
++			w := httptest.NewRecorder()
++			p.serveReady(w, httptest.NewRequest(http.MethodGet, "/metrics", nil), state)
++			if w.Code != http.StatusServiceUnavailable || p.inflight.Load() != 0 || p.lastUse.Load() != 123 {
++				t.Fatalf("unready status=%d inflight=%d lastUse=%d", w.Code, p.inflight.Load(), p.lastUse.Load())
++			}
++		})
++	}
++}
++
++func TestProcessCommand_ServeReadyHTTPRejectsStoppedProcess(t *testing.T) {
++	p := &ProcessCommand{id: "observability"}
++	p.lastUse.Store(123)
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("observation forwarded from an unready process") })
++	p.handler.Store(&handler)
++	w := httptest.NewRecorder()
++	p.ServeReadyHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
++	if w.Code != http.StatusServiceUnavailable || p.inflight.Load() != 0 || p.lastUse.Load() != 123 {
++		t.Fatalf("status=%d inflight=%d lastUse=%d", w.Code, p.inflight.Load(), p.lastUse.Load())
++	}
++}
+diff --git a/internal/process/process.go b/internal/process/process.go
+index a955ff1..d646d94 100644
+--- a/internal/process/process.go
++++ b/internal/process/process.go
+@@ -83,4 +83,11 @@ type Process interface {
+ 
+ 	// Logger returns the monitor that captures this process's stdout/stderr.
+ 	Logger() *logmon.Monitor
++
++	// ServeReadyHTTP forwards a request to the running process without
++	// admission control: it never starts or swaps a model, and it neither
++	// counts the request as in-flight nor refreshes the model's idle timer.
++	// A process that is not ready answers 503 and the request never reaches
++	// its handler.
++	ServeReadyHTTP(http.ResponseWriter, *http.Request)
+ }
+diff --git a/internal/router/base.go b/internal/router/base.go
+index 85a6c0e..49d8620 100644
+--- a/internal/router/base.go
++++ b/internal/router/base.go
+@@ -503,6 +503,28 @@ func (b *baseRouter) Shutdown(timeout time.Duration) error {
+ 	return <-req.respond
+ }
+ 
++func (b *baseRouter) ServeReadyHTTP(w http.ResponseWriter, req *http.Request) {
++	if b.shuttingDown.Load() {
++		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
++		return
++	}
++	data, err := swaputil.FetchContext(req, b.config)
++	if err != nil {
++		swaputil.SendError(w, req, err)
++		return
++	}
++	p, ok := b.processes[data.ModelID]
++	if !ok {
++		swaputil.SendError(w, req, scheduler.ErrModelNotFound)
++		return
++	}
++	if p.State() != process.StateReady {
++		swaputil.SendResponse(w, req, http.StatusConflict, fmt.Sprintf("model %s is not loaded", data.ModelID))
++		return
++	}
++	p.ServeReadyHTTP(w, req)
++}
++
+ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	if b.shuttingDown.Load() {
+ 		swaputil.SendError(w, req, fmt.Errorf("%s is shutting down", b.name))
+diff --git a/internal/router/helpers_test.go b/internal/router/helpers_test.go
+index 8f65324..f933f04 100644
+--- a/internal/router/helpers_test.go
++++ b/internal/router/helpers_test.go
+@@ -296,6 +296,10 @@ func (f *fakeProcess) WaitReady(ctx context.Context) error {
+ 
+ func (f *fakeProcess) Logger() *logmon.Monitor { return logmon.NewWriter(io.Discard) }
+ 
++func (f *fakeProcess) ServeReadyHTTP(w http.ResponseWriter, r *http.Request) {
++	f.ServeHTTP(w, r)
++}
++
+ func (f *fakeProcess) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+ 	f.serveCalls.Add(1)
+ 	f.inFlightServe.Add(1)
+diff --git a/internal/router/observability_test.go b/internal/router/observability_test.go
+new file mode 100644
+index 0000000..abe7422
+--- /dev/null
++++ b/internal/router/observability_test.go
+@@ -0,0 +1,85 @@
++package router
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/mostlygeek/llama-swap/internal/config"
++	"github.com/mostlygeek/llama-swap/internal/process"
++	"github.com/mostlygeek/llama-swap/internal/swaputil"
++)
++
++type observabilityProcess struct{ *fakeProcess }
++
++func (p *observabilityProcess) ServeReadyHTTP(w http.ResponseWriter, r *http.Request) {
++	p.serveCalls.Add(1)
++	w.WriteHeader(http.StatusOK)
++}
++
++func observabilityRequest(method string) *http.Request {
++	r := httptest.NewRequest(method, "/metrics", nil)
++	return r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: "a", ModelID: "a", Metadata: make(map[string]string)}))
++}
++
++func TestBaseRouter_ReadyForwardingBypassesAdmission(t *testing.T) {
++	p := &observabilityProcess{newFakeProcess("a")}
++	p.markReady()
++	p.serveBlock = make(chan struct{})
++	b := newTestBaseWithConfig(t, config.Config{Models: map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}}}, map[string]process.Process{"a": p}, &stubPlanner{})
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		b.ServeHTTP(httptest.NewRecorder(), newRequest("a"))
++	}()
++	defer func() { close(p.serveBlock); <-done }()
++	<-p.serveStarted
++	rejected := httptest.NewRecorder()
++	b.ServeHTTP(rejected, newRequest("a"))
++	if rejected.Code != http.StatusTooManyRequests {
++		t.Fatalf("inference status=%d", rejected.Code)
++	}
++	for _, method := range []string{http.MethodGet, http.MethodHead} {
++		w := httptest.NewRecorder()
++		b.ServeReadyHTTP(w, observabilityRequest(method))
++		if w.Code != http.StatusOK {
++			t.Fatalf("%s status=%d", method, w.Code)
++		}
++	}
++	if p.runCalls.Load() != 0 || p.stopCalls.Load() != 0 {
++		t.Fatal("ready forwarding changed process lifecycle")
++	}
++}
++
++func TestBaseRouter_ReadyForwardingRejectsUnready(t *testing.T) {
++	for _, state := range []process.ProcessState{process.StateStopped, process.StateStarting, process.StateStopping, process.StateShutdown} {
++		t.Run(string(state), func(t *testing.T) {
++			p := newFakeProcess("a")
++			p.setState(state)
++			b := newTestBase(t, map[string]process.Process{"a": p}, &stubPlanner{})
++			w := httptest.NewRecorder()
++			b.ServeReadyHTTP(w, observabilityRequest(http.MethodGet))
++			if w.Code != http.StatusConflict {
++				t.Fatalf("status=%d", w.Code)
++			}
++			if p.runCalls.Load() != 0 || p.stopCalls.Load() != 0 || p.serveCalls.Load() != 0 {
++				t.Fatal("unready forwarding touched the process")
++			}
++		})
++	}
++}
++
++func TestBaseRouter_ReadyForwardingRejectsShutdown(t *testing.T) {
++	p := newFakeProcess("a")
++	p.markReady()
++	b := newTestBase(t, map[string]process.Process{"a": p}, &stubPlanner{})
++	if err := b.Shutdown(time.Second); err != nil {
++		t.Fatal(err)
++	}
++	w := httptest.NewRecorder()
++	b.ServeReadyHTTP(w, observabilityRequest(http.MethodGet))
++	if w.Code < 500 || p.serveCalls.Load() != 0 {
++		t.Fatalf("shutdown status=%d serveCalls=%d", w.Code, p.serveCalls.Load())
++	}
++}
+diff --git a/internal/router/router.go b/internal/router/router.go
+index 416aef4..468eb40 100644
+--- a/internal/router/router.go
++++ b/internal/router/router.go
+@@ -37,6 +37,12 @@ type Router interface {
+ type LocalRouter interface {
+ 	Router
+ 
++	// ServeReadyHTTP forwards a request to the model's process without
++	// admission control: it never starts, swaps or queues a model and does
++	// not hold a loaded model against a swap. A model that is not ready
++	// answers 409; one that stops mid-request answers 503.
++	ServeReadyHTTP(http.ResponseWriter, *http.Request)
++
+ 	// RunningModels returns the current state of every process that is not
+ 	// stopped or shut down, keyed by model ID.
+ 	RunningModels() map[string]process.ProcessState
+diff --git a/internal/server/api.go b/internal/server/api.go
+index d9fe754..1eafd01 100644
+--- a/internal/server/api.go
++++ b/internal/server/api.go
+@@ -507,6 +507,15 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
+ 	// Pin the resolved model so the router skips body/query extraction.
+ 	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{Model: searchName, ModelID: modelID, Metadata: make(map[string]string)}))
+ 
++	if (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.local.Handles(modelID) {
++		for _, path := range s.cfg.Upstream.ObservabilityPaths {
++			if remainingPath == path {
++				s.local.ServeReadyHTTP(w, r)
++				return
++			}
++		}
++	}
++
+ 	// If the path matches an upstream.ignorePaths entry and the model is
+ 	// not already loaded, refuse the request without triggering a swap. The
+ 	// server was not able to process the response because the model was not
+diff --git a/internal/server/observability_test.go b/internal/server/observability_test.go
+new file mode 100644
+index 0000000..f5356a1
+--- /dev/null
++++ b/internal/server/observability_test.go
+@@ -0,0 +1,57 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/mostlygeek/llama-swap/internal/config"
++)
++
++func TestServer_UpstreamObservabilityRouting(t *testing.T) {
++	for _, tc := range []struct {
++		name, method, path, key string
++		paths                   []string
++		status                  int
++	}{
++		{"metrics", http.MethodGet, "/upstream/m1/metrics", "secret", []string{"/metrics", "/health"}, http.StatusOK},
++		{"head", http.MethodHead, "/upstream/m1/metrics", "secret", []string{"/metrics"}, http.StatusOK},
++		{"health", http.MethodGet, "/upstream/m1/health", "secret", []string{"/health"}, http.StatusOK},
++		{"query", http.MethodGet, "/upstream/m1/metrics?name=foo", "secret", []string{"/metrics"}, http.StatusOK},
++		{"missing key", http.MethodGet, "/upstream/m1/metrics", "", []string{"/metrics"}, http.StatusUnauthorized},
++		{"wrong key", http.MethodGet, "/upstream/m1/metrics", "wrong", []string{"/metrics"}, http.StatusUnauthorized},
++		{"post", http.MethodPost, "/upstream/m1/metrics", "secret", []string{"/metrics"}, http.StatusTooManyRequests},
++		{"trailing slash", http.MethodGet, "/upstream/m1/metrics/", "secret", []string{"/metrics"}, http.StatusTooManyRequests},
++		{"lookalike", http.MethodGet, "/upstream/m1/metrics-extra", "secret", []string{"/metrics"}, http.StatusTooManyRequests},
++		{"inference", http.MethodPost, "/upstream/m1/v1/chat/completions", "secret", []string{"/metrics"}, http.StatusTooManyRequests},
++		{"default unchanged", http.MethodGet, "/upstream/m1/metrics", "secret", nil, http.StatusTooManyRequests},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			local := newStubRouter([]string{"m1"}, "")
++			ordinary, ready := 0, 0
++			local.serveHTTP = func(w http.ResponseWriter, r *http.Request) { ordinary++; w.WriteHeader(http.StatusTooManyRequests) }
++			local.readyHTTP = func(w http.ResponseWriter, r *http.Request) { ready++; w.WriteHeader(http.StatusOK) }
++			s := newTestServer(local, newStubRouter(nil, ""))
++			s.cfg = config.Config{RequiredAPIKeys: []string{"secret"}, Models: map[string]config.ModelConfig{"m1": {}}, Upstream: config.UpstreamConfig{ObservabilityPaths: tc.paths}}
++			s.routes()
++			r := httptest.NewRequest(tc.method, tc.path, nil)
++			if tc.key != "" {
++				r.Header.Set("Authorization", "Bearer "+tc.key)
++			}
++			w := httptest.NewRecorder()
++			s.ServeHTTP(w, r)
++			if w.Code != tc.status {
++				t.Fatalf("status=%d expected=%d body=%q", w.Code, tc.status, w.Body.String())
++			}
++			if tc.status == http.StatusOK && (ready != 1 || ordinary != 0) {
++				t.Fatalf("ready=%d ordinary=%d", ready, ordinary)
++			}
++			if tc.status == http.StatusTooManyRequests && (ready != 0 || ordinary != 1) {
++				t.Fatalf("ready=%d ordinary=%d", ready, ordinary)
++			}
++			if tc.status == http.StatusUnauthorized && (ready != 0 || ordinary != 0) {
++				t.Fatalf("unauthorized request reached router: ready=%d ordinary=%d", ready, ordinary)
++			}
++		})
++	}
++}
+diff --git a/internal/server/server_test.go b/internal/server/server_test.go
+index 92681bf..d2eec0a 100644
+--- a/internal/server/server_test.go
++++ b/internal/server/server_test.go
+@@ -29,6 +29,7 @@ import (
+ type stubRouter struct {
+ 	models        map[string]bool
+ 	response      string
++	readyHTTP     func(http.ResponseWriter, *http.Request)
+ 	serveHTTP     func(http.ResponseWriter, *http.Request)
+ 	shutdownCalls atomic.Int32
+ 	running       map[string]process.ProcessState
+@@ -76,6 +77,13 @@ func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
+ 		s.onUnload()
+ 	}
+ }
++func (s *stubRouter) ServeReadyHTTP(w http.ResponseWriter, r *http.Request) {
++	if s.readyHTTP != nil {
++		s.readyHTTP(w, r)
++		return
++	}
++	http.Error(w, "unexpected ready-only dispatch", http.StatusInternalServerError)
++}
+ func (s *stubRouter) SetStartGate(func() error) {}
+ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
+ 	if s.loggers != nil {
