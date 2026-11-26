@@ -1,5 +1,5 @@
 {
-  description = "llama-swap with ready-only observability forwarding";
+  description = "llama-swap with ready-only observability forwarding and a priority-shaped concurrency limit";
 
   inputs = {
     flake-lib.url = "github:jgus-org/flake-lib/v1";
@@ -27,7 +27,10 @@
         packages = rec {
           default = llama-swap;
           llama-swap = pkgs.llama-swap-minimal.overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ [ ./observability.patch ];
+            patches = (old.patches or [ ]) ++ [
+              ./observability.patch
+              ./priority-admission.patch
+            ];
           });
         };
       }
