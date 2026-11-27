@@ -1,0 +1,1250 @@
+From 65e32157da6f512f6fa1a4a5d82670d6114573d7 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 26 Nov 2026 13:46:51 -0700
+Subject: [PATCH] Add per-model priority-shaped concurrency limit
+
+Requests carrying a JSON "priority" field (lower is more urgent, as vLLM's
+--scheduling-policy priority reads it) are now admitted by a prefix test: a
+request at priority p gets in when fewer than priorityConcurrencyLimit
+requests are in flight at priority <= p. A flood of low-urgency traffic can no
+longer shed an urgent request. One priority level can still fill the whole cap,
+so total in flight can exceed it.
+
+Opt-in per model via the new priorityConcurrencyLimit key. Unset or 0 leaves a
+model on the flat concurrencyLimit test, byte-for-byte as before; when both
+keys are set the new one wins. Rejection is the same 429 with Retry-After: 1.
+The field is the request body's, unrelated to
+routing.scheduler.settings.fifo.priority, which ranks queued swaps and is
+higher-is-first.
+
+Admission bookkeeping becomes one ledger per model, keyed by priority with
+buckets in ascending order, so the model's total is the sum of its buckets
+rather than a second counter that could fall out of step. Every release site
+carries the priority the admitting HandlerReq held (or the ServeDoneEvent
+built from it), and a release that finds no such bucket panics naming the
+model and priority.
+---
+ config-schema.json                            |   6 +
+ docs/config.example.yaml                      |  14 +
+ docs/kb/guides/routing/capacity-and-queues.md |  46 ++-
+ internal/config/model_config.go               |   3 +
+ internal/config/model_config_test.go          |  20 ++
+ internal/router/base.go                       |  11 +-
+ internal/router/base_test.go                  |  56 +++
+ internal/router/scheduler/fifo.go             | 139 ++++++--
+ internal/router/scheduler/fifo_test.go        | 321 +++++++++++++++++-
+ internal/router/scheduler/scheduler.go        |  12 +-
+ internal/server/priority.go                   |  67 ++++
+ internal/server/priority_test.go              | 234 +++++++++++++
+ internal/server/server.go                     |   1 +
+ internal/swaputil/http.go                     |   3 +
+ 14 files changed, 888 insertions(+), 45 deletions(-)
+ create mode 100644 internal/server/priority.go
+ create mode 100644 internal/server/priority_test.go
+
+diff --git a/config-schema.json b/config-schema.json
+index b170f7d..f483429 100644
+--- a/config-schema.json
++++ b/config-schema.json
+@@ -580,6 +580,12 @@
+                         "default": 0,
+                         "description": "Overrides allowed number of active parallel requests to a model. 0 uses internal default of 10. >0 overrides default. Requests exceeding limit get HTTP 429."
+                     },
++                    "priorityConcurrencyLimit": {
++                        "type": "integer",
++                        "minimum": 0,
++                        "default": 0,
++                        "description": "Replaces concurrencyLimit as this model's admission cap, applied per request priority instead of to the total: a request is admitted when fewer than this many requests are in flight at a priority at least as urgent as its own. Lower is more urgent; a request that states none counts as 0. 0 leaves the option off and concurrencyLimit governs. >0 replaces concurrencyLimit. Requests exceeding limit get HTTP 429."
++                    },
+                     "sendLoadingState": {
+                         "type": "boolean",
+                         "description": "Overrides the global sendLoadingState for this model. Ommitting this property will use the global setting."
+diff --git a/docs/config.example.yaml b/docs/config.example.yaml
+index 5a7bb49..1583447 100644
+--- a/docs/config.example.yaml
++++ b/docs/config.example.yaml
+@@ -537,6 +537,20 @@ models:
+     # - recommended to be omitted and the default used
+     concurrencyLimit: 0
+ 
++    # priorityConcurrencyLimit: replaces concurrencyLimit as this model's admission cap,
++    # applied per request priority instead of to the total
++    # - optional, default: 0
++    # - a request is admitted when fewer than this many requests are in flight at a priority
++    #   at least as urgent as its own, so low-urgency traffic cannot shed urgent requests.
++    #   Lower values are more urgent and a request that states none counts as 0
++    # - the priority here is the request-body "priority" field, not the higher-is-first
++    #   routing.scheduler.settings.fifo.priority
++    # - must be set per model
++    # - 0 leaves the option off and concurrencyLimit governs
++    # - when both keys are set this one wins and concurrencyLimit does not apply
++    # - any requests that exceeds the limit will receive an HTTP 429 Too Many Requests response
++    priorityConcurrencyLimit: 0
++
+     # sendLoadingState: overrides the global sendLoadingState setting for this model
+     # - optional, default: undefined (use global setting)
+     sendLoadingState: false
+diff --git a/docs/kb/guides/routing/capacity-and-queues.md b/docs/kb/guides/routing/capacity-and-queues.md
+index e29b113..d874869 100644
+--- a/docs/kb/guides/routing/capacity-and-queues.md
++++ b/docs/kb/guides/routing/capacity-and-queues.md
+@@ -1,10 +1,10 @@
+ ---
+ title: Routing capacity and request queues
+-summary: Configure concurrencyLimit and globalConcurrencyLimit, and understand queued work while a model is loading or busy.
++summary: Configure concurrencyLimit, priorityConcurrencyLimit and globalConcurrencyLimit, and understand queued work while a model is loading or busy.
+ category: guides
+-tags: [routing, queue, capacity, concurrency, concurrency-limit, max-concurrent-requests, global-concurrency-limit, rate-limit]
+-config_keys: [routing, models.*.concurrencyLimit, globalConcurrencyLimit]
+-updated: 2026-09-10
++tags: [routing, queue, capacity, concurrency, concurrency-limit, priority-concurrency-limit, max-concurrent-requests, global-concurrency-limit, rate-limit]
++config_keys: [routing, models.*.concurrencyLimit, models.*.priorityConcurrencyLimit, globalConcurrencyLimit]
++updated: 2026-11-26
+ ---
+ 
+ # Routing capacity and request queues
+@@ -21,6 +21,44 @@ Inspect the Activity view and logs when latency grows. A queue that never drains
+ usually means the command, proxy, or health check is wrong; see
+ `guides/model-runtime/troubleshooting-model-wont-load`.
+ 
++## Priority-shaped concurrency limit
++
++`models.*.priorityConcurrencyLimit` replaces `concurrencyLimit` for one model
++and applies the cap per request priority instead of to the total. Priority is
++the request-body `priority` field, the vLLM convention: lower is more urgent, a
++request that states none is 0, and a negative value is more urgent than 0. This
++is not `routing.scheduler.settings.fifo.priority`, which ranks queued model
++swaps and is higher-is-first.
++
++```yaml
++models:
++  gpt-oss:
++    priorityConcurrencyLimit: 24
++```
++
++A request carrying priority `p` is admitted when fewer than
++`priorityConcurrencyLimit` requests are already in flight for the model at
++priority `p` or lower. In flight means admitted and not yet finished: queued,
++waiting on a swap, or being served. Traffic less urgent than a request never
++blocks it. Each priority level can use the whole cap on its own, so total in
++flight can exceed it. With a cap of 24, twenty-four in-flight requests at
++priority 0 shed a new request at priority 0 and at priority 50, but admit one
++at priority -1.
++
++A non-integer priority counts as 0, and so does a form upload, which cannot
++carry the field. The priority is read after request-body filters run, so a
++server-side `setParams` stamp sets it too and you can assign urgency to a client
++that does not send one.
++
++Use this with a backend that ranks work the same way, such as vLLM started with
++`--scheduling-policy priority`, which accepts the same integer field. The router
++decides whether to accept a request. The backend decides which of its in-flight
++work runs first.
++
++Rejection is unchanged: an immediate HTTP 429 with `Retry-After: 1`, the same
++response `concurrencyLimit` produces. When both keys are set for a model,
++`priorityConcurrencyLimit` wins and `concurrencyLimit` does not apply.
++
+ ## Global concurrency limit
+ 
+ `globalConcurrencyLimit` is a top-level setting, separate from
+diff --git a/internal/config/model_config.go b/internal/config/model_config.go
+index 0152ef8..3cdd6cc 100644
+--- a/internal/config/model_config.go
++++ b/internal/config/model_config.go
+@@ -156,6 +156,9 @@ type ModelConfig struct {
+ 	// Limit concurrency of HTTP requests to process
+ 	ConcurrencyLimit int `yaml:"concurrencyLimit"`
+ 
++	// Limit concurrency per priority class, in place of concurrencyLimit
++	PriorityConcurrencyLimit int `yaml:"priorityConcurrencyLimit"`
++
+ 	// Model filters see issue #174
+ 	Filters ModelFilters `yaml:"filters"`
+ 
+diff --git a/internal/config/model_config_test.go b/internal/config/model_config_test.go
+index cabf3d2..0045cf8 100644
+--- a/internal/config/model_config_test.go
++++ b/internal/config/model_config_test.go
+@@ -73,6 +73,26 @@ models:
+ 	}
+ }
+ 
++func TestConfig_ModelPriorityConcurrencyLimit(t *testing.T) {
++	content := `
++models:
++  priorityCapped:
++    cmd: priorityCapped --port ${PORT}
++    priorityConcurrencyLimit: 24
++  concurrencyCapped:
++    cmd: concurrencyCapped --port ${PORT}
++    concurrencyLimit: 3
++  uncapped:
++    cmd: uncapped --port ${PORT}
++`
++	config, err := LoadConfigFromReader(strings.NewReader(content))
++	assert.NoError(t, err)
++	assert.Equal(t, 24, config.Models["priorityCapped"].PriorityConcurrencyLimit)
++	assert.Zero(t, config.Models["concurrencyCapped"].PriorityConcurrencyLimit)
++	assert.Equal(t, 3, config.Models["concurrencyCapped"].ConcurrencyLimit)
++	assert.Zero(t, config.Models["uncapped"].PriorityConcurrencyLimit)
++}
++
+ func TestConfig_ComfyUIOverrides(t *testing.T) {
+ 	if ComfyUIModelID != "comfyui_auto" {
+ 		t.Fatalf("ComfyUIModelID=%q want comfyui_auto", ComfyUIModelID)
+diff --git a/internal/router/base.go b/internal/router/base.go
+index 49d8620..a56377d 100644
+--- a/internal/router/base.go
++++ b/internal/router/base.go
+@@ -228,7 +228,7 @@ func (b *baseRouter) GrantError(req scheduler.HandlerReq, err error) {
+ // the router would never again be willing to evict this model.
+ func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
+ 	p := b.processes[modelID]
+-	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p)})
++	return b.grant(req, scheduler.HandlerResp{HandleFunc: b.trackedServe(modelID, p, req.Priority)})
+ }
+ 
+ // StopProcesses implements scheduler.Effects, stopping the named processes in
+@@ -261,11 +261,11 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
+ // The select on shutdownCtx.Done() is a release valve: if the router is
+ // already shutting down, nobody is reading serveDoneCh, so we drop the
+ // notification rather than blocking the HTTP goroutine forever.
+-func (b *baseRouter) trackedServe(modelID string, p process.Process) http.HandlerFunc {
++func (b *baseRouter) trackedServe(modelID string, p process.Process, priority int) http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
+ 		defer func() {
+ 			select {
+-			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID}:
++			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID, Priority: priority}:
+ 			case <-b.shutdownCtx.Done():
+ 			}
+ 		}()
+@@ -558,8 +558,9 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	}
+ 
+ 	hr := scheduler.HandlerReq{
+-		Model: data.ModelID,
+-		Ctx:   req.Context(),
++		Model:    data.ModelID,
++		Ctx:      req.Context(),
++		Priority: data.Priority,
+ 		// Unbuffered: a successful send on Respond proves the waiter is
+ 		// alive and consuming. grant() relies on this to avoid handing a
+ 		// handleFunc to a cancelled waiter and leaking the inFlight count.
+diff --git a/internal/router/base_test.go b/internal/router/base_test.go
+index 95f164c..e269a46 100644
+--- a/internal/router/base_test.go
++++ b/internal/router/base_test.go
+@@ -835,3 +835,59 @@ func TestBaseRouter_Shutdown_StopsAllProcesses(t *testing.T) {
+ 		t.Errorf("second Shutdown returned nil, want error")
+ 	}
+ }
++
++func priorityRequest(model string, priority int) *http.Request {
++	r := newRequest(model)
++	data := swaputil.ReqContextData{Model: model, ModelID: model, Priority: priority}
++	return r.WithContext(swaputil.SetContext(r.Context(), data))
++}
++
++// TestBaseRouter_PriorityConcurrencyCarriesPriorityThroughServe covers both
++// hand-offs base.go owns: the request it gives the scheduler and the completion
++// event that releases the reservation must carry the same priority.
++func TestBaseRouter_PriorityConcurrencyCarriesPriorityThroughServe(t *testing.T) {
++	conf := config.Config{
++		HealthCheckTimeout: 5,
++		Models:             map[string]config.ModelConfig{"a": {PriorityConcurrencyLimit: 1}},
++	}
++	a := newFakeProcess("a")
++	a.autoReady = true
++	a.serveBlock = make(chan struct{})
++
++	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a}, &stubPlanner{})
++
++	blocked := make(chan struct{})
++	go func() {
++		b.ServeHTTP(httptest.NewRecorder(), priorityRequest("a", 5))
++		close(blocked)
++	}()
++	waitSignal(t, a.serveStarted, "priority 5 request start")
++	waitProcessed(t, b.testProcessed, 1)
++
++	// The model is at capacity for that priority, so equal urgency is shed.
++	w := httptest.NewRecorder()
++	b.ServeHTTP(w, priorityRequest("a", 5))
++	if w.Code != http.StatusTooManyRequests {
++		t.Fatalf("status=%d want 429 body=%q", w.Code, w.Body.String())
++	}
++
++	// An urgent request gets in only because the router passed its priority on.
++	urgentW := httptest.NewRecorder()
++	urgent := make(chan struct{})
++	go func() {
++		b.ServeHTTP(urgentW, priorityRequest("a", -1))
++		close(urgent)
++	}()
++	waitProcessed(t, b.testProcessed, 1)
++
++	close(a.serveBlock)
++	waitSignal(t, blocked, "priority 5 request finish")
++	waitSignal(t, urgent, "urgent request finish")
++
++	// A finished request returns its slot, so the shed priority fits again.
++	w = httptest.NewRecorder()
++	b.ServeHTTP(w, priorityRequest("a", 5))
++	if w.Code != http.StatusOK {
++		t.Fatalf("status=%d want 200 body=%q", w.Code, w.Body.String())
++	}
++}
+diff --git a/internal/router/scheduler/fifo.go b/internal/router/scheduler/fifo.go
+index ea7d7f7..03ed40e 100644
+--- a/internal/router/scheduler/fifo.go
++++ b/internal/router/scheduler/fifo.go
+@@ -25,6 +25,72 @@ type activeSwap struct {
+ 	waiters    []HandlerReq
+ }
+ 
++type prioBucket struct {
++	priority int
++	count    int
++}
++
++// reservations is a model's admitted-but-unfinished requests per priority, kept
++// in ascending priority order so the requests blocking a new one form a prefix.
++// A nil ledger and an absent map entry are both empty.
++type reservations struct {
++	buckets []prioBucket
++}
++
++// find returns priority's bucket index, or where it would sort if absent.
++func (r *reservations) find(priority int) int {
++	return sort.Search(len(r.buckets), func(i int) bool { return r.buckets[i].priority >= priority })
++}
++
++func (r *reservations) add(priority int) {
++	i := r.find(priority)
++	if i < len(r.buckets) && r.buckets[i].priority == priority {
++		r.buckets[i].count++
++		return
++	}
++	r.buckets = append(r.buckets, prioBucket{})
++	copy(r.buckets[i+1:], r.buckets[i:])
++	r.buckets[i] = prioBucket{priority: priority, count: 1}
++}
++
++// remove gives one reservation back, or reports false if priority holds none.
++func (r *reservations) remove(priority int) bool {
++	i := r.find(priority)
++	if i == len(r.buckets) || r.buckets[i].priority != priority {
++		return false
++	}
++	r.buckets[i].count--
++	if r.buckets[i].count == 0 {
++		r.buckets = append(r.buckets[:i], r.buckets[i+1:]...)
++	}
++	return true
++}
++
++func (r *reservations) atLeastAsUrgent(priority int) int {
++	if r == nil {
++		return 0
++	}
++	var n int
++	for _, b := range r.buckets {
++		if b.priority > priority {
++			break
++		}
++		n += b.count
++	}
++	return n
++}
++
++func (r *reservations) total() int {
++	if r == nil {
++		return 0
++	}
++	var n int
++	for _, b := range r.buckets {
++		n += b.count
++	}
++	return n
++}
++
+ // FIFO is the default scheduler. Requests are handled in a first-in, first-out order.
+ // To reduce swapping requests for a model that is already running will be handled
+ // immediately by the running process.
+@@ -41,11 +107,12 @@ type FIFO struct {
+ 	cfg     config.FifoConfig
+ 	effects Effects
+ 
+-	limits   map[string]int
+-	active   map[string]*activeSwap
+-	reserved map[string]int
+-	inFlight map[string]int
+-	queued   []HandlerReq
++	limits         map[string]int
++	priorityLimits map[string]int
++	active         map[string]*activeSwap
++	reserved       map[string]*reservations
++	inFlight       map[string]int
++	queued         []HandlerReq
+ 
+ 	nextGeneration uint64
+ }
+@@ -55,24 +122,29 @@ type FIFO struct {
+ // when set to a value greater than zero.
+ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.FifoConfig, models map[string]config.ModelConfig, eff Effects) *FIFO {
+ 	limits := make(map[string]int, len(models))
++	priorityLimits := make(map[string]int, len(models))
+ 	for id, mc := range models {
+ 		limit := defaultConcurrencyLimit
+ 		if mc.ConcurrencyLimit > 0 {
+ 			limit = mc.ConcurrencyLimit
+ 		}
+ 		limits[id] = limit
++		if mc.PriorityConcurrencyLimit > 0 {
++			priorityLimits[id] = mc.PriorityConcurrencyLimit
++		}
+ 	}
+ 
+ 	return &FIFO{
+-		name:     name,
+-		logger:   logger,
+-		planner:  planner,
+-		cfg:      cfg,
+-		effects:  eff,
+-		limits:   limits,
+-		active:   make(map[string]*activeSwap),
+-		reserved: make(map[string]int),
+-		inFlight: make(map[string]int),
++		name:           name,
++		logger:         logger,
++		planner:        planner,
++		cfg:            cfg,
++		effects:        eff,
++		limits:         limits,
++		priorityLimits: priorityLimits,
++		active:         make(map[string]*activeSwap),
++		reserved:       make(map[string]*reservations),
++		inFlight:       make(map[string]int),
+ 	}
+ }
+ 
+@@ -158,7 +230,7 @@ func (s *FIFO) OnCancel(req HandlerReq) {
+ 		for _, q := range s.queued {
+ 			if q.Respond == req.Respond {
+ 				removed = true
+-				s.release(q.Model)
++				s.release(q.Model, q.Priority)
+ 				continue
+ 			}
+ 			kept = append(kept, q)
+@@ -172,7 +244,7 @@ func (s *FIFO) OnCancel(req HandlerReq) {
+ 		for _, w := range sw.waiters {
+ 			if w.Respond == req.Respond {
+ 				removed = true
+-				s.release(w.Model)
++				s.release(w.Model, w.Priority)
+ 				continue
+ 			}
+ 			filtered = append(filtered, w)
+@@ -214,7 +286,7 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
+ // have evicted this (now-idle) process can now proceed.
+ func (s *FIFO) OnServeDone(ev ServeDoneEvent) {
+ 	s.inFlight[ev.ModelID]--
+-	s.release(ev.ModelID)
++	s.release(ev.ModelID, ev.Priority)
+ 	if s.inFlight[ev.ModelID] <= 0 {
+ 		delete(s.inFlight, ev.ModelID)
+ 		s.drainQueue()
+@@ -297,14 +369,14 @@ func (s *FIFO) grantHandler(req HandlerReq, modelID string) {
+ 	if s.effects.GrantServe(req, modelID) {
+ 		s.inFlight[modelID]++
+ 	} else {
+-		s.release(modelID)
++		s.release(req.Model, req.Priority)
+ 	}
+ }
+ 
+ // grantError reports a post-admission error to the caller and releases the
+ // request's reserved concurrency slot.
+ func (s *FIFO) grantError(req HandlerReq, err error) {
+-	s.release(req.Model)
++	s.release(req.Model, req.Priority)
+ 	s.effects.GrantError(req, err)
+ }
+ 
+@@ -312,17 +384,31 @@ func (s *FIFO) grantError(req HandlerReq, err error) {
+ // one future serving slot until they serve, cancel while waiting, or receive a
+ // post-admission error.
+ func (s *FIFO) admit(req HandlerReq) bool {
+-	if s.reserved[req.Model] >= s.limit(req.Model) {
++	res := s.reserved[req.Model]
++	if s.blocked(res, req.Model, req.Priority) {
+ 		s.rejectAdmission(req, swaputil.ConcurrencyLimitError{})
+ 		return false
+ 	}
+ 	if !sendAdmission(req, nil) {
+ 		return false
+ 	}
+-	s.reserved[req.Model]++
++	if res == nil {
++		res = &reservations{}
++		s.reserved[req.Model] = res
++	}
++	res.add(req.Priority)
+ 	return true
+ }
+ 
++// blocked reports whether a request at priority exceeds its model's cap. A model
++// that set priorityConcurrencyLimit counts only reservations at least as urgent.
++func (s *FIFO) blocked(res *reservations, modelID string, priority int) bool {
++	if limit, ok := s.priorityLimits[modelID]; ok {
++		return res.atLeastAsUrgent(priority) >= limit
++	}
++	return res.total() >= s.limit(modelID)
++}
++
+ func (s *FIFO) rejectAdmission(req HandlerReq, err error) {
+ 	sendAdmission(req, err)
+ }
+@@ -352,12 +438,13 @@ func reqDone(req HandlerReq) <-chan struct{} {
+ 	return req.Ctx.Done()
+ }
+ 
+-func (s *FIFO) release(modelID string) {
+-	if s.reserved[modelID] <= 0 {
+-		panic(fmt.Sprintf("%s: release without reservation for model %s", s.name, modelID))
++// release gives back the reservation admit charged to (modelID, priority).
++func (s *FIFO) release(modelID string, priority int) {
++	res := s.reserved[modelID]
++	if res == nil || !res.remove(priority) {
++		panic(fmt.Sprintf("%s: release without reservation for model %s priority %d", s.name, modelID, priority))
+ 	}
+-	s.reserved[modelID]--
+-	if s.reserved[modelID] == 0 {
++	if res.total() == 0 {
+ 		delete(s.reserved, modelID)
+ 	}
+ }
+diff --git a/internal/router/scheduler/fifo_test.go b/internal/router/scheduler/fifo_test.go
+index 0e80997..65d2096 100644
+--- a/internal/router/scheduler/fifo_test.go
++++ b/internal/router/scheduler/fifo_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"io"
+ 	"net/http"
++	"slices"
+ 	"testing"
+ 	"time"
+ 
+@@ -176,6 +177,19 @@ func reqCh(model string) HandlerReq {
+ 	return r
+ }
+ 
++func reqPrio(model string, priority int) HandlerReq {
++	r := req(model)
++	r.Priority = priority
++	return r
++}
++
++// reqChPrio creates a cancellable HandlerReq carrying an explicit priority.
++func reqChPrio(model string, priority int) HandlerReq {
++	r := reqCh(model)
++	r.Priority = priority
++	return r
++}
++
+ func admitErr(t *testing.T, req HandlerReq) error {
+ 	t.Helper()
+ 	select {
+@@ -237,14 +251,28 @@ func TestFIFO_SendAdmission_NilAdmitPreservesExistingBehavior(t *testing.T) {
+ }
+ 
+ func TestFIFO_ReleaseWithoutReservationPanics(t *testing.T) {
+-	s := newFIFO(&stubPlanner{}, newFakeEffects())
++	t.Run("model with no reservations", func(t *testing.T) {
++		s := newFIFO(&stubPlanner{}, newFakeEffects())
+ 
+-	defer func() {
+-		if r := recover(); r == nil {
+-			t.Fatal("release without reservation did not panic")
+-		}
+-	}()
+-	s.release("a")
++		defer func() {
++			if r := recover(); r == nil {
++				t.Fatal("release without reservation did not panic")
++			}
++		}()
++		s.release("a", 0)
++	})
++
++	t.Run("priority that admission never charged", func(t *testing.T) {
++		s, _ := newFIFOWithLimit(t, "a", 2)
++		admitAndAssert(t, s, reqPrio("a", 5))
++
++		defer func() {
++			if r := recover(); r == nil {
++				t.Fatal("release of an uncharged priority did not panic")
++			}
++		}()
++		s.release("a", 6)
++	})
+ }
+ 
+ func TestFIFO_FastPath(t *testing.T) {
+@@ -1011,3 +1039,282 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
+ 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
+ 	}
+ }
++
++// newFIFOWithModels builds a FIFO with every model ready to serve, taking
++// configs from the caller so a test can see which limit governs admission.
++func newFIFOWithModels(t *testing.T, models map[string]config.ModelConfig) (*FIFO, *fakeEffects) {
++	t.Helper()
++	eff := newFakeEffects()
++	for model := range models {
++		eff.states[model] = process.StateReady
++	}
++	s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
++	return s, eff
++}
++
++// TestFIFO_PriorityConcurrency_BurstDoesNotShedMoreUrgent: a model whose cap is
++// full of low-urgency traffic still admits a more urgent request.
++func TestFIFO_PriorityConcurrency_BurstDoesNotShedMoreUrgent(t *testing.T) {
++	// concurrencyLimit 1 next to priorityConcurrencyLimit 3 so a request admitted
++	// past the first can only be the priority cap's doing.
++	s, eff := newFIFOWithModels(t, map[string]config.ModelConfig{
++		"a": {ConcurrencyLimit: 1, PriorityConcurrencyLimit: 3},
++	})
++
++	for range 3 {
++		r := reqPrio("a", 10)
++		s.OnRequest(r)
++		assertAdmitted(t, r)
++	}
++	if got := eff.served("a"); got != 3 {
++		t.Fatalf("served(a)=%d want 3", got)
++	}
++
++	// The burst fills the cap for its own priority and anything less urgent.
++	for _, priority := range []int{10, 50} {
++		r := reqPrio("a", priority)
++		s.OnRequest(r)
++		assertAdmission429(t, r)
++	}
++
++	// A more urgent request sees no reservation at all in its way.
++	urgent := reqPrio("a", -1)
++	s.OnRequest(urgent)
++	assertAdmitted(t, urgent)
++
++	// Each priority still gets only its own share of the cap.
++	for range 2 {
++		r := reqPrio("a", -1)
++		s.OnRequest(r)
++		assertAdmitted(t, r)
++	}
++	full := reqPrio("a", -1)
++	s.OnRequest(full)
++	assertAdmission429(t, full)
++}
++
++func TestFIFO_PriorityConcurrency_EqualPriorityBlocksItsOwnKind(t *testing.T) {
++	s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{
++		"a": {PriorityConcurrencyLimit: 2},
++	})
++
++	first := reqPrio("a", 0)
++	second := reqPrio("a", 0)
++	s.OnRequest(first)
++	s.OnRequest(second)
++	assertAdmitted(t, first)
++	assertAdmitted(t, second)
++
++	third := reqPrio("a", 0)
++	s.OnRequest(third)
++	assertAdmission429(t, third)
++
++	// A served request gives its bucket's slot back to its own priority.
++	s.OnServeDone(ServeDoneEvent{ModelID: "a", Priority: 0})
++	fourth := reqPrio("a", 0)
++	s.OnRequest(fourth)
++	assertAdmitted(t, fourth)
++}
++
++func TestFIFO_PriorityConcurrency_AbsentPriorityIsZeroAndNegativeIsUrgent(t *testing.T) {
++	s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{
++		"a": {PriorityConcurrencyLimit: 1},
++	})
++
++	silent := req("a")
++	s.OnRequest(silent)
++	assertAdmitted(t, silent)
++
++	// A silent request and an explicit 0 are the same priority, so both shed.
++	for _, r := range []HandlerReq{req("a"), reqPrio("a", 0)} {
++		s.OnRequest(r)
++		assertAdmission429(t, r)
++	}
++
++	// A negative priority is more urgent than 0.
++	urgent := reqPrio("a", -1)
++	s.OnRequest(urgent)
++	assertAdmitted(t, urgent)
++}
++
++// TestFIFO_PriorityConcurrency_ReleasePaths walks every site that returns a
++// reservation. One aimed at the wrong bucket panics rather than drifting.
++func TestFIFO_PriorityConcurrency_ReleasePaths(t *testing.T) {
++	t.Run("serve completion", func(t *testing.T) {
++		s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{
++			"a": {PriorityConcurrencyLimit: 1},
++		})
++
++		serving := reqPrio("a", 7)
++		s.OnRequest(serving)
++		assertAdmitted(t, serving)
++
++		blocked := reqPrio("a", 7)
++		s.OnRequest(blocked)
++		assertAdmission429(t, blocked)
++
++		s.OnServeDone(ServeDoneEvent{ModelID: "a", Priority: 7})
++
++		after := reqPrio("a", 7)
++		s.OnRequest(after)
++		assertAdmitted(t, after)
++	})
++
++	t.Run("cancel while queued", func(t *testing.T) {
++		eff := newFakeEffects()
++		eff.states["a"] = process.StateStopped
++		eff.states["b"] = process.StateStopped
++		models := map[string]config.ModelConfig{
++			"a": {PriorityConcurrencyLimit: 1},
++			"b": {},
++		}
++		planner := &stubPlanner{evict: map[string][]string{"a": {"b"}}}
++		s := NewFIFO("test", logmon.NewWriter(io.Discard), planner, config.FifoConfig{}, models, eff)
++
++		bReq := req("b")
++		cancelled := reqChPrio("a", 4)
++		rejected := reqPrio("a", 4)
++		s.OnRequest(bReq)
++		s.OnRequest(cancelled)
++		s.OnRequest(rejected)
++		assertAdmitted(t, bReq)
++		assertAdmitted(t, cancelled)
++		assertAdmission429(t, rejected)
++
++		s.OnCancel(cancelled)
++
++		retry := reqPrio("a", 4)
++		s.OnRequest(retry)
++		assertAdmitted(t, retry)
++	})
++
++	t.Run("cancel while waiting on a swap", func(t *testing.T) {
++		eff := newFakeEffects()
++		eff.states["a"] = process.StateStopped
++		models := map[string]config.ModelConfig{
++			"a": {PriorityConcurrencyLimit: 2},
++		}
++		s := NewFIFO("test", logmon.NewWriter(io.Discard), &stubPlanner{}, config.FifoConfig{}, models, eff)
++
++		starter := reqPrio("a", 3)
++		waiter := reqChPrio("a", 3)
++		s.OnRequest(starter)
++		s.OnRequest(waiter)
++		assertAdmitted(t, starter)
++		assertAdmitted(t, waiter)
++		if sw := s.active["a"]; len(sw.waiters) != 2 {
++			t.Fatalf("waiters=%d want 2", len(sw.waiters))
++		}
++
++		s.OnCancel(waiter)
++
++		// One slot came back to the bucket, and only one.
++		replacement := reqPrio("a", 3)
++		s.OnRequest(replacement)
++		assertAdmitted(t, replacement)
++		if sw := s.active["a"]; len(sw.waiters) != 2 {
++			t.Fatalf("waiters=%d want 2 after the replacement joined", len(sw.waiters))
++		}
++
++		over := reqPrio("a", 3)
++		s.OnRequest(over)
++		assertAdmission429(t, over)
++	})
++}
++
++// TestFIFO_PriorityConcurrency_UniformPriorityMatchesFlatLimit: when every
++// request states the same priority the prefix rule is the flat count.
++func TestFIFO_PriorityConcurrency_UniformPriorityMatchesFlatLimit(t *testing.T) {
++	const limit = 3
++
++	run := func(t *testing.T, models map[string]config.ModelConfig) []bool {
++		t.Helper()
++		s, _ := newFIFOWithModels(t, models)
++
++		var admitted []bool
++		attempt := func() {
++			r := reqPrio("a", 0)
++			s.OnRequest(r)
++			admitted = append(admitted, admitErr(t, r) == nil)
++		}
++
++		attempt()
++		attempt()
++		attempt()
++		attempt()
++		s.OnServeDone(ServeDoneEvent{ModelID: "a"})
++		attempt()
++		s.OnServeDone(ServeDoneEvent{ModelID: "a"})
++		s.OnServeDone(ServeDoneEvent{ModelID: "a"})
++		for range 3 {
++			attempt()
++		}
++		return admitted
++	}
++
++	priorityCapped := run(t, map[string]config.ModelConfig{"a": {PriorityConcurrencyLimit: limit}})
++	flat := run(t, map[string]config.ModelConfig{"a": {ConcurrencyLimit: limit}})
++
++	if want := []bool{true, true, true, false, true, true, true, false}; !slices.Equal(priorityCapped, want) {
++		t.Fatalf("priority-capped admissions = %v, want %v", priorityCapped, want)
++	}
++	if !slices.Equal(priorityCapped, flat) {
++		t.Fatalf("admissions differ: priority-capped %v, flat %v", priorityCapped, flat)
++	}
++}
++
++// TestFIFO_PriorityConcurrency_OptInOnly: the cap governs only models that set it.
++func TestFIFO_PriorityConcurrency_OptInOnly(t *testing.T) {
++	t.Run("concurrencyLimit governs when the key is absent", func(t *testing.T) {
++		s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{"a": {ConcurrencyLimit: 1}})
++
++		admitAndAssert(t, s, req("a"))
++
++		urgent := reqPrio("a", -100)
++		s.OnRequest(urgent)
++		assertAdmission429(t, urgent)
++	})
++
++	t.Run("zero value leaves concurrencyLimit in charge", func(t *testing.T) {
++		s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{
++			"a": {ConcurrencyLimit: 1, PriorityConcurrencyLimit: 0},
++		})
++
++		admitAndAssert(t, s, req("a"))
++
++		urgent := reqPrio("a", -100)
++		s.OnRequest(urgent)
++		assertAdmission429(t, urgent)
++	})
++
++	t.Run("default of ten still applies", func(t *testing.T) {
++		s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{"a": {}})
++
++		for range 10 {
++			admitAndAssert(t, s, req("a"))
++		}
++		over := reqPrio("a", -100)
++		s.OnRequest(over)
++		assertAdmission429(t, over)
++	})
++
++	t.Run("priorityConcurrencyLimit wins when both are set", func(t *testing.T) {
++		s, _ := newFIFOWithModels(t, map[string]config.ModelConfig{
++			"a": {ConcurrencyLimit: 1, PriorityConcurrencyLimit: 2},
++		})
++
++		// concurrencyLimit would have shed this second request.
++		admitAndAssert(t, s, reqPrio("a", 0))
++		admitAndAssert(t, s, reqPrio("a", 0))
++
++		over := reqPrio("a", 0)
++		s.OnRequest(over)
++		assertAdmission429(t, over)
++	})
++}
++
++func admitAndAssert(t *testing.T, s *FIFO, r HandlerReq) {
++	t.Helper()
++	s.OnRequest(r)
++	assertAdmitted(t, r)
++}
+diff --git a/internal/router/scheduler/scheduler.go b/internal/router/scheduler/scheduler.go
+index d1482ff..b2aeabc 100644
+--- a/internal/router/scheduler/scheduler.go
++++ b/internal/router/scheduler/scheduler.go
+@@ -112,8 +112,13 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
+ 
+ // HandlerReq is one in-flight ServeHTTP request waiting for a routing decision.
+ type HandlerReq struct {
+-	Model      string
+-	Ctx        context.Context
++	Model string
++	Ctx   context.Context
++
++	// Priority is the request's urgency from its JSON body: lower is more urgent,
++	// 0 when unstated. Not FifoConfig.Priority, which ranks queued swaps and is
++	// higher-is-first.
++	Priority   int
+ 	Admit      chan error
+ 	Respond    chan HandlerResp
+ 	PositionCh chan int
+@@ -135,5 +140,6 @@ type SwapDone struct {
+ 
+ // ServeDoneEvent is reported when a tracked ServeHTTP handler returns.
+ type ServeDoneEvent struct {
+-	ModelID string
++	ModelID  string
++	Priority int
+ }
+diff --git a/internal/server/priority.go b/internal/server/priority.go
+new file mode 100644
+index 0000000..929cefa
+--- /dev/null
++++ b/internal/server/priority.go
+@@ -0,0 +1,67 @@
++package server
++
++import (
++	"bytes"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++
++	"github.com/mostlygeek/llama-swap/internal/chain"
++	"github.com/mostlygeek/llama-swap/internal/config"
++	"github.com/mostlygeek/llama-swap/internal/swaputil"
++	"github.com/tidwall/gjson"
++)
++
++// CreatePriorityMiddleware records the urgency a request states, so a model that
++// set priorityConcurrencyLimit can gate admission on it. It runs after the body
++// filters, so a server-side setParams stamp decides both admission and what the
++// backend sees.
++//
++// The buffered body is re-attached with Content-Length / Transfer-Encoding
++// cleanup so the reverse proxy forwards the correct bytes (see issue #11).
++func CreatePriorityMiddleware(cfg config.Config) chain.Middleware {
++	return func(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			data, ok := swaputil.ReadContext(r.Context())
++			if !ok {
++				next.ServeHTTP(w, r)
++				return
++			}
++
++			mc, ok := cfg.Models[data.ModelID]
++			if !ok || mc.PriorityConcurrencyLimit <= 0 {
++				next.ServeHTTP(w, r)
++				return
++			}
++
++			if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
++				next.ServeHTTP(w, r)
++				return
++			}
++
++			body, err := io.ReadAll(r.Body)
++			if err != nil {
++				swaputil.SendResponse(w, r, http.StatusBadRequest, "could not read request body")
++				return
++			}
++
++			data.Priority = jsonPriority(body)
++			r.Body = io.NopCloser(bytes.NewReader(body))
++			r.Header.Del("Transfer-Encoding")
++			r.Header.Set("Content-Length", strconv.Itoa(len(body)))
++			r.ContentLength = int64(len(body))
++
++			next.ServeHTTP(w, r.WithContext(swaputil.SetContext(r.Context(), data)))
++		})
++	}
++}
++
++// jsonPriority reads the "priority" field; anything but a whole JSON number is 0.
++func jsonPriority(body []byte) int {
++	value := gjson.GetBytes(body, "priority")
++	if value.Type != gjson.Number || strings.ContainsAny(value.Raw, ".eE") {
++		return 0
++	}
++	return int(value.Int())
++}
+diff --git a/internal/server/priority_test.go b/internal/server/priority_test.go
+new file mode 100644
+index 0000000..1922e5e
+--- /dev/null
++++ b/internal/server/priority_test.go
+@@ -0,0 +1,234 @@
++package server
++
++import (
++	"bytes"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"testing"
++
++	"github.com/mostlygeek/llama-swap/internal/chain"
++	"github.com/mostlygeek/llama-swap/internal/config"
++	"github.com/mostlygeek/llama-swap/internal/swaputil"
++)
++
++// countingBody proves the middleware read the body it inherited.
++type countingBody struct {
++	io.Reader
++	reads int
++}
++
++func (b *countingBody) Read(p []byte) (int, error) {
++	b.reads++
++	return b.Reader.Read(p)
++}
++
++func (b *countingBody) Close() error { return nil }
++
++// priorityResult is what the middleware handed downstream. readsBeforeHandler
++// is measured before the handler runs, attributing any read to the middleware.
++type priorityResult struct {
++	priority           int
++	body               string
++	contentLength      string
++	bodyLength         int
++	readsBeforeHandler int
++	reached            bool
++}
++
++// runPriorityMiddleware feeds req through the middleware; body is the reader
++// it inherits.
++func runPriorityMiddleware(t *testing.T, cfg config.Config, req *http.Request) priorityResult {
++	t.Helper()
++
++	var result priorityResult
++	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		data, ok := swaputil.ReadContext(r.Context())
++		if !ok {
++			t.Error("downstream handler found no request context")
++			return
++		}
++		if body, ok := r.Body.(*countingBody); ok {
++			result.readsBeforeHandler = body.reads
++		}
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("downstream handler could not read body: %v", err)
++			return
++		}
++		result.priority = data.Priority
++		result.body = string(body)
++		result.contentLength = r.Header.Get("Content-Length")
++		result.bodyLength = int(r.ContentLength)
++		result.reached = true
++	})
++
++	chain.New(CreatePriorityMiddleware(cfg)).Then(next).ServeHTTP(httptest.NewRecorder(), req)
++	return result
++}
++
++// jsonRequest is a chat completion whose model FetchContext already resolved.
++func jsonRequest(t *testing.T, cfg config.Config, body string) *http.Request {
++	t.Helper()
++
++	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
++	req.Header.Set("Content-Type", "application/json")
++	if _, err := swaputil.FetchContext(req, cfg); err != nil {
++		t.Fatalf("FetchContext: %v", err)
++	}
++	return req
++}
++
++func optedInConfig(limit int) config.Config {
++	return config.Config{Models: map[string]config.ModelConfig{
++		"llama": {PriorityConcurrencyLimit: limit},
++	}}
++}
++
++func TestServer_PriorityMiddleware_readsBodyPriority(t *testing.T) {
++	cfg := optedInConfig(4)
++
++	for _, tc := range []struct {
++		name string
++		body string
++		want int
++	}{
++		{name: "stated priority", body: `{"model":"llama","priority":5}`, want: 5},
++		{name: "negative is more urgent, not unset", body: `{"model":"llama","priority":-3}`, want: -3},
++		{name: "explicit zero", body: `{"model":"llama","priority":0}`, want: 0},
++		{name: "absent", body: `{"model":"llama"}`, want: 0},
++		{name: "null", body: `{"model":"llama","priority":null}`, want: 0},
++		{name: "quoted number", body: `{"model":"llama","priority":"5"}`, want: 0},
++		{name: "boolean", body: `{"model":"llama","priority":true}`, want: 0},
++		{name: "fractional", body: `{"model":"llama","priority":1.5}`, want: 0},
++		{name: "exponent form", body: `{"model":"llama","priority":1e3}`, want: 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got := runPriorityMiddleware(t, cfg, jsonRequest(t, cfg, tc.body))
++			if !got.reached {
++				t.Fatal("downstream handler was not reached")
++			}
++			if got.priority != tc.want {
++				t.Errorf("priority = %d, want %d", got.priority, tc.want)
++			}
++			if got.body != tc.body {
++				t.Errorf("body downstream = %q, want %q", got.body, tc.body)
++			}
++			if got.contentLength != strconv.Itoa(len(tc.body)) {
++				t.Errorf("Content-Length = %q, want %d", got.contentLength, len(tc.body))
++			}
++			if got.bodyLength != len(tc.body) {
++				t.Errorf("ContentLength = %d, want %d", got.bodyLength, len(tc.body))
++			}
++		})
++	}
++}
++
++func TestServer_PriorityMiddleware_afterFilters(t *testing.T) {
++	// Mounted after the filters, the middleware must record the server-side stamp
++	// rather than the value the client sent.
++	cfg := config.Config{Models: map[string]config.ModelConfig{
++		"llama": {
++			PriorityConcurrencyLimit: 4,
++			Filters: config.ModelFilters{Filters: config.Filters{
++				SetParams: map[string]any{"priority": 7},
++			}},
++		},
++	}}
++
++	req := jsonRequest(t, cfg, `{"model":"llama","priority":-9}`)
++
++	var got priorityResult
++	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		data, _ := swaputil.ReadContext(r.Context())
++		body, err := io.ReadAll(r.Body)
++		if err != nil {
++			t.Errorf("downstream handler could not read body: %v", err)
++			return
++		}
++		got = priorityResult{priority: data.Priority, body: string(body), reached: true}
++	})
++
++	chain.New(CreateFilterMiddleware(cfg), CreatePriorityMiddleware(cfg)).Then(next).ServeHTTP(httptest.NewRecorder(), req)
++
++	if !got.reached {
++		t.Fatal("downstream handler was not reached")
++	}
++	if got.priority != 7 {
++		t.Errorf("priority = %d, want the filter-stamped 7", got.priority)
++	}
++	if !bytes.Contains([]byte(got.body), []byte(`"priority":7`)) {
++		t.Errorf("body downstream = %q, want the stamped priority", got.body)
++	}
++}
++
++func TestServer_PriorityMiddleware_untouchedModelsAndBodies(t *testing.T) {
++	t.Run("model without the option set", func(t *testing.T) {
++		cfg := config.Config{Models: map[string]config.ModelConfig{"llama": {ConcurrencyLimit: 4}}}
++
++		req := jsonRequest(t, cfg, `{"model":"llama","priority":-3}`)
++		body := &countingBody{Reader: bytes.NewBufferString(`{"model":"llama","priority":-3}`)}
++		req.Body = body
++
++		got := runPriorityMiddleware(t, cfg, req)
++		if got.priority != 0 {
++			t.Errorf("priority = %d, want 0 for a model that did not opt in", got.priority)
++		}
++		if got.readsBeforeHandler != 0 {
++			t.Errorf("middleware made %d reads on a model that did not opt in", got.readsBeforeHandler)
++		}
++		if got.body != `{"model":"llama","priority":-3}` {
++			t.Errorf("body downstream = %q, want the inherited body", got.body)
++		}
++	})
++
++	t.Run("non-JSON body", func(t *testing.T) {
++		cfg := optedInConfig(4)
++
++		const form = `model=llama&priority=-3`
++		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(form))
++		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++		if _, err := swaputil.FetchContext(req, cfg); err != nil {
++			t.Fatalf("FetchContext: %v", err)
++		}
++		body := &countingBody{Reader: bytes.NewBufferString(form)}
++		req.Body = body
++
++		got := runPriorityMiddleware(t, cfg, req)
++		if got.priority != 0 {
++			t.Errorf("priority = %d, want 0 for a non-JSON body", got.priority)
++		}
++		if got.readsBeforeHandler != 0 {
++			t.Errorf("middleware made %d reads on a non-JSON body", got.readsBeforeHandler)
++		}
++		if got.body != form {
++			t.Errorf("body downstream = %q, want the inherited body", got.body)
++		}
++	})
++
++	t.Run("unknown model", func(t *testing.T) {
++		cfg := optedInConfig(4)
++		cfg.Models["other"] = config.ModelConfig{Cmd: "llama-server"}
++
++		req := jsonRequest(t, cfg, `{"model":"other","priority":9}`)
++		got := runPriorityMiddleware(t, cfg, req)
++		if got.priority != 0 {
++			t.Errorf("priority = %d, want 0 for a model with no priorityConcurrencyLimit", got.priority)
++		}
++	})
++
++	t.Run("request with no cached context", func(t *testing.T) {
++		cfg := optedInConfig(4)
++
++		reached := false
++		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true })
++		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"llama","priority":3}`))
++		req.Header.Set("Content-Type", "application/json")
++
++		chain.New(CreatePriorityMiddleware(cfg)).Then(next).ServeHTTP(httptest.NewRecorder(), req)
++		if !reached {
++			t.Error("request with no cached context did not reach the next handler")
++		}
++	})
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index e363756..a784cec 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -380,6 +380,7 @@ func (s *Server) routes() {
+ 		CreateInflightMiddleware(s.inflight, s.cfg),
+ 		CreateFilterMiddleware(s.cfg),
+ 		CreateFormFilterMiddleware(s.cfg),
++		CreatePriorityMiddleware(s.cfg),
+ 		CreateMetricsMiddleware(s.metrics, s.cfg),
+ 	)
+ 	modelChain := chain.New(modelMWs...)
+diff --git a/internal/swaputil/http.go b/internal/swaputil/http.go
+index 59fa426..1d4a70f 100644
+--- a/internal/swaputil/http.go
++++ b/internal/swaputil/http.go
+@@ -30,6 +30,9 @@ type ReqContextData struct {
+ 	ModelID          string
+ 	Streaming        bool
+ 	SendLoadingState bool
++
++	Priority int
++
+ 	// Metadata is a request-scoped key/value bag that handlers may mutate
+ 	// while processing. The metrics middleware copies it into ActivityLogEntry.
+ 	Metadata map[string]string
+-- 
+2.56.0
+
